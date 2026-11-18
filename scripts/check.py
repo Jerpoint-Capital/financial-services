@@ -13,20 +13,48 @@ Checks:
 Exit 0 if clean, 1 otherwise. Requires: pyyaml.
 """
 import json
+import subprocess
 import sys
 from pathlib import Path
-
-try:
-    import yaml
-except ImportError:
-    print("ERROR: requires pyyaml (pip install pyyaml)", file=sys.stderr)
-    sys.exit(2)
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGINS = ROOT / "plugins"
 MANAGED = ROOT / "managed-agent-cookbooks"
 errors: list[str] = []
 checked = 0
+
+
+def ensure_hooks_installed() -> None:
+    """Point git at .githooks so the version-bump pre-commit runs.
+
+    Native equivalent of Husky's `prepare`, piggybacked on the script
+    everyone already runs before committing. Best-effort: never fatal.
+    """
+    want = ".githooks"
+    try:
+        cur = subprocess.run(
+            ["git", "-C", str(ROOT), "config", "--get", "core.hooksPath"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        if cur != want:
+            subprocess.run(
+                ["git", "-C", str(ROOT), "config", "core.hooksPath", want],
+                check=True, capture_output=True,
+            )
+            print(f"[check.py] installed git hooks (core.hooksPath -> {want})")
+    except (subprocess.SubprocessError, OSError):
+        pass  # not a git checkout / git unavailable — ignore
+
+
+# Install hooks before anything that can exit early (e.g. missing pyyaml),
+# so a fresh checkout still gets the version-bump hook wired up.
+ensure_hooks_installed()
+
+try:
+    import yaml
+except ImportError:
+    print("ERROR: requires pyyaml (pip install pyyaml)", file=sys.stderr)
+    sys.exit(2)
 
 
 def err(msg: str) -> None:
@@ -156,6 +184,31 @@ for d in sorted(MANAGED.iterdir()):
     for req in ("agent.yaml", "README.md", "steering-examples.json"):
         if not (d / req).is_file():
             err(f"missing: {rel(d)}/{req}")
+
+# --- 6. PowerShell scripts must be pure ASCII -------------------------------
+# Windows PowerShell 5.1 -- still the default shell on managed Windows -- reads
+# a .ps1 with no BOM using the machine's ANSI code page, not UTF-8. A smart dash
+# or curly quote then decodes to mojibake that can contain a literal '"',
+# which terminates a string mid-file and makes the whole script fail to PARSE.
+# It is invisible on macOS and total on Windows, so gate it here.
+ASCII_ONLY_SUFFIXES = {".ps1", ".psm1", ".psd1"}
+for ps in sorted(ROOT.rglob("*.ps1")):
+    if any(part in {".git", "node_modules"} for part in ps.parts):
+        continue
+    checked += 1
+    raw = ps.read_bytes()
+    if raw.startswith(b"\xef\xbb\xbf"):
+        continue  # an explicit BOM tells PS 5.1 it is UTF-8; then non-ASCII is fine
+    for lineno, line in enumerate(raw.split(b"\n"), 1):
+        bad = sorted({b for b in line if b > 0x7F})
+        if bad:
+            chars = ", ".join(f"0x{b:02x}" for b in bad[:5])
+            err(
+                f"non-ascii: {rel(ps)}:{lineno}: byte(s) {chars} in a .ps1 with no "
+                f"UTF-8 BOM -- Windows PowerShell 5.1 will mis-decode this and may "
+                f"fail to parse the file. Use ASCII (-- for an em dash) or add a BOM."
+            )
+            break
 
 # --- report ----------------------------------------------------------------
 if errors:
